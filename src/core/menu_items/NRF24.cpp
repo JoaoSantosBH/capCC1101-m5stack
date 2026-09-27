@@ -5,15 +5,32 @@
 #include "modules/NRF24/nrf_jammer.h"
 #include "modules/NRF24/nrf_mousejack.h"
 #include "modules/NRF24/nrf_spectrum.h"
+#include <interface.h>
 
 void NRF24Menu::optionsMenu() {
+#ifdef TCA8418_I2C_ADDR
+    adv_flush_keyboard_events(); // drain residual TCA8418 FIFO events (phantom Esc)
+#endif
+
+    // ADV 3in1: wrap each RF call so the flag blocks I2C windows during the scan.
+    // Pins stay OUTPUT (set at boot); no Wire1.end/begin needed here.
+#ifdef TCA8418_I2C_ADDR
+    auto nrfRun = [](void (*fn)()) {
+        adv_release_keyboard(); // set flag — InputHandler/codec skip I2C windows
+        fn();
+        adv_keyboard_restore(); // clear flag + flush FIFO
+    };
+#else
+    auto nrfRun = [](void (*fn)()) { fn(); };
+#endif
+
     options.clear();
-    options.push_back({"Information", nrf_info});
-    options.push_back({"Spectrum", nrf_spectrum});
+    options.push_back({"Information", [&]() { nrfRun(nrf_info);      }});
+    options.push_back({"Spectrum",    [&]() { nrfRun(nrf_spectrum);  }});
     #if !defined(LITE_VERSION)
-    options.push_back({"MouseJack", nrf_mousejack});
+    options.push_back({"MouseJack",   [&]() { nrfRun(nrf_mousejack); }});
     #endif
-    options.push_back({"NRF Jammer", nrf_jammer});
+    options.push_back({"NRF Jammer",  [&]() { nrfRun(nrf_jammer);   }});
 
 #if defined(ARDUINO_M5STICK_C_PLUS) || defined(ARDUINO_M5STICK_C_PLUS2)
     options.push_back({"Config pins", [this]() { configMenu(); }});

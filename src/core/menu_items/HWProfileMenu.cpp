@@ -8,6 +8,12 @@
 
 static void setProfileAndApply(uint8_t prof) {
     saveHWProfile(prof);
+    if (prof == HW_ADV_3IN1 || loadHWProfile() == HW_ADV_3IN1) {
+        // ADV 3in1 requires G8/G9 multiplexing set up at boot — must reboot.
+        displaySuccess("Reboot: " + String(hwProfileName(prof)));
+        delay(1500);
+        ESP.restart();
+    }
     applyHWProfile(prof);
     bruceConfigPins.saveFile(); // persist new pin assignments (GPS, CC1101, LoRa, etc.)
     displaySuccess(String("Profile: ") + hwProfileName(prof));
@@ -20,6 +26,7 @@ void HWProfileMenu::optionsMenu() {
         {"Cap LoRa-1262", [=]() { setProfileAndApply(HW_CAP_LORA);    }},
         {"Stock/Shield",  [=]() { setProfileAndApply(HW_STOCK);       }},
         {"Grove GPS v1.1",[=]() { setProfileAndApply(HW_GROVE_GPS);   }},
+        {"ADV 3in1",      [=]() { setProfileAndApply(HW_ADV_3IN1);    }},
     };
     addOptionToMainMenu();
     loopOptions(options, MENU_TYPE_SUBMENU, title.c_str());

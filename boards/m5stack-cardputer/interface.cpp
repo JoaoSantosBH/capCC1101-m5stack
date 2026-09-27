@@ -87,6 +87,7 @@ const char *hwProfileName(uint8_t prof) {
         case HW_CAP_LORA:   return "Cap LoRa (beta)";
         case HW_STOCK:      return "Stock";
         case HW_GROVE_GPS:  return "Grove GPS v1.1";
+        case HW_ADV_3IN1:   return "ADV 3in1";
         default:            return "Unknown";
     }
 }
@@ -153,6 +154,24 @@ void applyHWProfile(uint8_t prof) {
             bruceConfigPins.gps_bus.tx  = (gpio_num_t)2;
             bruceConfigPins.gpsBaudrate = 9600;
             break;
+
+        case HW_ADV_3IN1:
+            // JosephCGS ADV 3-in-1 board:
+            //   CC1101: CS=G15, GDO0=G13   (SPI shared: SCK=40/MISO=39/MOSI=14)
+            //   LoRa:   CS=G5,  RST=G3, DIO0=G4
+            //   NRF24:  SS=G9,  CE=G8      (GPIO8/9 shared with TCA8418 I2C SDA/SCL)
+            bruceConfigPins.CC1101_bus.cs  = (gpio_num_t)15;
+            bruceConfigPins.CC1101_bus.io0 = (gpio_num_t)13;
+            bruceConfigPins.LoRa_bus.cs    = (gpio_num_t)5;
+            bruceConfigPins.LoRa_bus.sck   = (gpio_num_t)40;
+            bruceConfigPins.LoRa_bus.miso  = (gpio_num_t)39;
+            bruceConfigPins.LoRa_bus.mosi  = (gpio_num_t)14;
+            bruceConfigPins.LoRa_bus.io0   = (gpio_num_t)3;  // RST
+            bruceConfigPins.LoRa_bus.io2   = (gpio_num_t)4;  // DIO0
+            bruceConfigPins.gps_bus.rx     = (gpio_num_t)1;
+            bruceConfigPins.gps_bus.tx     = (gpio_num_t)2;
+            bruceConfigPins.gpsBaudrate    = 115200;
+            break;
     }
 }
 
@@ -172,8 +191,36 @@ void _setup_gpio() {
     pinMode(6,  OUTPUT); digitalWrite(6,  HIGH); // NRF24 CS
     pinMode(12, OUTPUT); digitalWrite(12, HIGH); // SD card CS (defensive)
     pinMode(13, OUTPUT); digitalWrite(13, HIGH); // CC1101 CS (Stock profile)
+    pinMode(15, OUTPUT); digitalWrite(15, HIGH); // CC1101 CS (ADV 3in1 profile)
 }
 volatile bool kb_interrupt = false;
+static uint8_t activeHWProfile    = HW_CAP_CC1101;
+static bool adv_keyboard_released = false; // true while NRF24 holds G8/G9
+
+// G8/G9 are shared between TCA8418 I2C (SDA/SCL) and NRF24 CE/SS on ADV 3in1.
+// G8/G9 stay OUTPUT by default so NRF24 can use them freely.
+// Every I2C user (TCA8418 reads, ES8311 writes) briefly calls setI2cPinsToI2c()
+// before the transaction and setI2cPinsToOutput() after.
+// While NRF24 is active (adv_keyboard_released=true), all I2C windows are blocked.
+// Reference-counted I2C window: nested calls (e.g. uiBeep→codec inside InputHandler)
+// do not prematurely end Wire1. Wire1.end() only runs when the outermost caller exits.
+static int i2c_window_depth = 0;
+static void setI2cPinsToI2c() {
+    if (i2c_window_depth == 0) {
+        Wire1.begin(TCA8418_SDA_PIN, TCA8418_SCL_PIN);
+        delay(5);
+    }
+    i2c_window_depth++;
+}
+static void setI2cPinsToOutput() {
+    if (i2c_window_depth > 0) i2c_window_depth--;
+    if (i2c_window_depth == 0) {
+        Wire1.end();
+        pinMode(TCA8418_SDA_PIN, OUTPUT); digitalWrite(TCA8418_SDA_PIN, HIGH);
+        pinMode(TCA8418_SCL_PIN, OUTPUT); digitalWrite(TCA8418_SCL_PIN, HIGH);
+    }
+}
+
 void IRAM_ATTR gpio_isr_handler(void *arg) {
     kb_interrupt = true;
     // static long i = 0;
@@ -214,26 +261,64 @@ void _post_setup_gpio() {
     bruceConfigPins.sys_i2c.sda = (gpio_num_t)8;
     bruceConfigPins.sys_i2c.scl = (gpio_num_t)9;
 
-    applyHWProfile(loadHWProfile());
+    uint8_t hwProf = loadHWProfile();
+    activeHWProfile = hwProf;
+    applyHWProfile(hwProf);
 
-    bruceConfigPins.NRF24_bus.sck = (gpio_num_t)40;
+    bruceConfigPins.NRF24_bus.sck  = (gpio_num_t)40;
     bruceConfigPins.NRF24_bus.miso = (gpio_num_t)39;
     bruceConfigPins.NRF24_bus.mosi = (gpio_num_t)14;
-    bruceConfigPins.NRF24_bus.cs = (gpio_num_t)6;
-    bruceConfigPins.NRF24_bus.io0 = (gpio_num_t)4;
+    if (hwProf == HW_ADV_3IN1) {
+        bruceConfigPins.NRF24_bus.cs  = (gpio_num_t)9; // SS=G9 (shared with TCA8418 SCL)
+        bruceConfigPins.NRF24_bus.io0 = (gpio_num_t)8; // CE=G8 (shared with TCA8418 SDA)
+    } else {
+        bruceConfigPins.NRF24_bus.cs  = (gpio_num_t)6;
+        bruceConfigPins.NRF24_bus.io0 = (gpio_num_t)4;
+    }
 
-    pinMode(bruceConfigPins.NRF24_bus.cs, OUTPUT);
     pinMode(bruceConfigPins.CC1101_bus.cs, OUTPUT);
     pinMode(bruceConfigPins.LoRa_bus.cs, OUTPUT);
-    digitalWrite(bruceConfigPins.NRF24_bus.cs, HIGH);
     digitalWrite(bruceConfigPins.CC1101_bus.cs, HIGH);
     digitalWrite(bruceConfigPins.LoRa_bus.cs, HIGH);
+    // NRF24 CS: G6 for all non-ADV profiles; G9 (ADV) released by setI2cPinsToOutput() below.
+    if (hwProf != HW_ADV_3IN1) {
+        pinMode(bruceConfigPins.NRF24_bus.cs, OUTPUT);
+        digitalWrite(bruceConfigPins.NRF24_bus.cs, HIGH);
+    }
 
     tca.matrix(7, 8);
     tca.flush();
     pinMode(11, INPUT);
     attachInterruptArg(digitalPinToInterrupt(11), gpio_isr_handler, nullptr, CHANGE);
     tca.enableInterrupts();
+
+    // ADV 3in1: release G8/G9 from I2C to OUTPUT so NRF24 can use them by default.
+    if (hwProf == HW_ADV_3IN1) {
+        setI2cPinsToOutput();
+    }
+}
+
+// Drain TCA8418 FIFO and clear phantom EscPress.
+// Uses a brief I2C window on ADV 3in1 (pins normally OUTPUT).
+void adv_flush_keyboard_events() {
+    if (activeHWProfile == HW_ADV_3IN1) setI2cPinsToI2c();
+    while (tca.available() > 0) tca.getEvent();
+    tca.writeRegister(TCA8418_REG_INT_STAT, 1);
+    if (activeHWProfile == HW_ADV_3IN1) setI2cPinsToOutput();
+    EscPress = false;
+}
+
+// Mark NRF24 as active: blocks all I2C windows (pins already OUTPUT since boot).
+void adv_release_keyboard() {
+    if (activeHWProfile != HW_ADV_3IN1) return;
+    adv_keyboard_released = true;
+}
+
+// Mark NRF24 as done: re-enables I2C windows and flushes TCA8418 FIFO.
+void adv_keyboard_restore() {
+    if (activeHWProfile != HW_ADV_3IN1) return;
+    adv_keyboard_released = false;
+    adv_flush_keyboard_events();
 }
 
 /*********************************************************************
@@ -303,6 +388,9 @@ void InputHandler(void) {
                 Serial.println("Forcing keyboard interrupt, Restoring Interruptions.");
                 kb_interrupt = true;
             }
+
+            // ADV 3in1: G8/G9 are OUTPUT by default; briefly switch to I2C to read TCA8418.
+            if (activeHWProfile == HW_ADV_3IN1) setI2cPinsToI2c();
 
             while (tca.available() > 0) {
                 int keyEvent = tca.getEvent();
@@ -430,6 +518,9 @@ void InputHandler(void) {
             tca.writeRegister(TCA8418_REG_INT_STAT, 1);
             int intstat = tca.readRegister(TCA8418_REG_INT_STAT);
             if ((intstat & 0x01) == 0) { kb_interrupt = false; }
+
+            // ADV 3in1: release G8/G9 back to OUTPUT after TCA8418 read.
+            if (activeHWProfile == HW_ADV_3IN1) setI2cPinsToOutput();
         }
 
         unsigned long now = millis();
@@ -587,7 +678,14 @@ void _setup_codec_speaker(bool enable) {
     };
     static constexpr const uint8_t disabled_bulk_data[] = {0};
 
+    // ADV 3in1: G8/G9 are OUTPUT by default; briefly switch to I2C for codec write.
+    // If NRF24 is active (adv_keyboard_released), skip — pins are in use.
+    if (activeHWProfile == HW_ADV_3IN1) {
+        if (adv_keyboard_released) return;
+        setI2cPinsToI2c();
+    }
     i2c_bulk_write(&Wire1, ES8311_ADDR, enable ? enabled_bulk_data : disabled_bulk_data);
+    if (activeHWProfile == HW_ADV_3IN1) setI2cPinsToOutput();
 }
 
 /*********************************************************************
@@ -624,5 +722,12 @@ void _setup_codec_mic(bool enable) {
         0
     };
 
+    // ADV 3in1: G8/G9 are OUTPUT by default; briefly switch to I2C for codec write.
+    // If NRF24 is active (adv_keyboard_released), skip — pins are in use.
+    if (activeHWProfile == HW_ADV_3IN1) {
+        if (adv_keyboard_released) return;
+        setI2cPinsToI2c();
+    }
     i2c_bulk_write(&Wire1, ES8311_ADDR, enable ? enabled_bulk_data : disabled_bulk_data);
+    if (activeHWProfile == HW_ADV_3IN1) setI2cPinsToOutput();
 }

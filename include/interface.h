@@ -17,6 +17,21 @@ void _setup_gpio();
 void _post_setup_gpio();
 
 /***************************************************************************************
+** Functions: adv_release_keyboard / adv_keyboard_restore / adv_flush_keyboard_events
+** Location: boards/m5stack-cardputer/interface.cpp
+** Description: ADV 3in1 G8/G9 multiplexing between TCA8418 I2C and NRF24 CE/SS.
+**   adv_release_keyboard()      — flag NRF24 active; blocks I2C windows (pins stay OUTPUT)
+**   adv_keyboard_restore()      — flag NRF24 done; re-enables I2C windows + flushes FIFO
+**   adv_flush_keyboard_events() — drain TCA8418 FIFO + clear EscPress
+**   No-ops on non-ADV profiles.
+***************************************************************************************/
+#ifdef TCA8418_I2C_ADDR
+void adv_release_keyboard();
+void adv_keyboard_restore();
+void adv_flush_keyboard_events();
+#endif
+
+/***************************************************************************************
 ** Function name: _pre_storage_gpio()
 ** Location: main.cpp
 ** Description:   board gpio setup that must run after the first TFT use and before storage

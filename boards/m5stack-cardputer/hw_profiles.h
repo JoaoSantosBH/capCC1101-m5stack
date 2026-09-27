@@ -11,6 +11,7 @@ enum HWProfile : uint8_t {
     HW_CAP_LORA   = 1, // Cap LoRa SX1262 (beta – pins not yet validated)
     HW_STOCK      = 2, // Standard Cardputer-Adv without a Cap RF module
     HW_GROVE_GPS  = 3, // GPS Unit v1.1 (MAX2659) on Grove port G1/G2
+    HW_ADV_3IN1   = 4, // JosephCGS: CC1101(cs=15,gdo0=13) + LoRa(cs=5,rst=3,dio0=4) + NRF24(ss=9,ce=8)
     HW_PROFILE_COUNT
 };
 
