@@ -7,6 +7,7 @@
 #include <Arduino.h>
 #include <FS.h>
 #include <LittleFS.h>
+#include <core/sd_functions.h>
 #include <RadioLib.h>
 #include <core/display.h>
 #include <core/mykeyboard.h>
@@ -378,6 +379,7 @@ void mainloop() {
 
 void lorachat() {
     // set filesystem thing
+    setupLittleFS();
     if (!LittleFS.exists("/chats.txt")) {
         File file = LittleFS.open("/chats.txt", "w");
         file.close();
@@ -387,7 +389,7 @@ void lorachat() {
         Serial.println("creating lora settings .json file");
         JsonDocument doc;
         File file = LittleFS.open("/lora_settings.json", "w");
-        doc["LoRa_Frequency"] = "434500000.00";
+        doc["LoRa_Frequency"] = "868000000.00";
         doc["LoRa_Name"] = "JomarOLider";
         doc["LoRa_Radio"] = "SX1276";
         serializeJson(doc, file);
@@ -445,7 +447,17 @@ void changeusername() {
 
 void chfreq() {
     tft.fillScreen(TFT_BLACK);
+    setupLittleFS();
     char buf[15];
+    if (!LittleFS.exists("/lora_settings.json")) {
+        JsonDocument defaults;
+        File f = LittleFS.open("/lora_settings.json", "w");
+        defaults["LoRa_Frequency"] = "868000000.00";
+        defaults["LoRa_Name"] = "JomarOLider";
+        defaults["LoRa_Radio"] = "SX1276";
+        serializeJson(defaults, f);
+        f.close();
+    }
     File file = LittleFS.open("/lora_settings.json", "r");
     JsonDocument doc;
     deserializeJson(doc, file);
