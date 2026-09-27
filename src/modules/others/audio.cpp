@@ -697,6 +697,16 @@ void playTone(unsigned int frequency, unsigned long duration, short waveType) {
             v *= volumeScale;
             return v;
         });
+    } else if (waveType == 2) {
+        // Bell: sine wave with exponential decay — instant attack, natural fade-out.
+        // Adding a soft 2nd partial (2.756× freq) gives the inharmonic overtone
+        // characteristic of real bells.
+        file->addAudioGenerators([volumeScale, hz](const float time) {
+            float decay = expf(-9.0f * time);
+            float v = sinf(TWO_PI * hz * time)
+                    + 0.25f * sinf(TWO_PI * hz * 2.756f * time);
+            return v * decay * volumeScale;
+        });
     }
 
     AudioGeneratorWAV *wav = new AudioGeneratorWAV();
@@ -750,3 +760,107 @@ void _tone(unsigned int frequency, unsigned long duration) {
 #endif
 #endif
 }
+
+// ===== ASYNC UI BEEP =====
+// Root cause of "no sound": AudioGeneratorWAV::begin() always calls
+// output->begin() → i2s_new_channel() — no guard. So I2S is torn down
+// and rebuilt on every beep, causing ~500ms amp warmup every time.
+//
+// Fix: bypass AudioGeneratorWAV entirely. Keep one persistent AudioOutputI2S
+// (begin() called once at task start). Push bell samples directly via
+// ConsumeSample(). I2S clock and NS4168 amp stay warm between beeps —
+// all beeps after the first are instantaneous.
+
+struct BeepRequest {
+    unsigned int freq;
+    unsigned long ms;
+};
+
+static QueueHandle_t g_beepQueue = nullptr;
+
+static void uiBeepTask(void *) {
+    AudioOutputI2S *out = nullptr;
+    bool warm = false; // true after first begin() + silence offset played
+
+    BeepRequest req;
+    for (;;) {
+        if (xQueueReceive(g_beepQueue, &req, portMAX_DELAY) != pdTRUE) continue;
+        if (!bruceConfig.soundEnabled) continue;
+
+        // If main audio grabbed I2S, release our channel.
+        if (isAudioPlaying()) {
+            if (out) { out->stop(); delete out; out = nullptr; warm = false; }
+            continue;
+        }
+
+        if (!out) {
+            _setup_codec_speaker(true);
+            out = createConfiguredAudioOutput();
+            if (!out) continue;
+            out->begin(); // installs I2S channel; amp needs time to settle
+            warm = false;
+        } else {
+            out->SetGain(bruceConfig.soundVolume / AUDIO_VOLUME_MAX);
+        }
+
+        // First beep after boot (or after main audio): amp needs ~400ms to come
+        // out of pop-suppression. Feed silence for that window, then play the bell.
+        // All subsequent beeps: hardware is already warm, play immediately.
+        const float SR       = 44100.0f;
+        const int silenceMs  = warm ? 0 : 420;
+        const int silenceSmp = (int)(SR * silenceMs / 1000.0f);
+        const int bellSmp    = (int)(SR * req.ms / 1000.0f);
+        const float hz       = (float)req.freq;
+        const float vol      = (bruceConfig.soundVolume / AUDIO_VOLUME_MAX) * AUDIO_VOLUME_SCALE;
+
+        int16_t z[2] = {0, 0};
+        for (int i = 0; i < silenceSmp; i++) {
+            while (!out->ConsumeSample(z)) taskYIELD();
+        }
+        warm = true;
+
+        for (int i = 0; i < bellSmp; i++) {
+            if ((i & 0xFF) == 0) {
+                if (uxQueueMessagesWaiting(g_beepQueue) > 0) goto flush_silence;
+                if (isAudioPlaying()) { out->stop(); delete out; out = nullptr; warm = false; goto next_beep; }
+            }
+            float t = i / SR;
+            float v = (sinf(TWO_PI * hz * t) + 0.25f * sinf(TWO_PI * hz * 2.756f * t))
+                      * expf(-9.0f * t) * vol;
+            int16_t s = (int16_t)(v * 32767.0f);
+            int16_t smp[2] = {s, s};
+            while (!out->ConsumeSample(smp)) taskYIELD();
+        }
+
+flush_silence:
+        // Fill all DMA buffers with zeros so the ring doesn't keep replaying
+        // the last non-zero waveform samples (default: 5 * 4608/4 = 5760 frames).
+        {
+            const int flushFrames = 5 * (4608 / 4);
+            int16_t z[2] = {0, 0};
+            for (int i = 0; i < flushFrames; i++) {
+                while (!out->ConsumeSample(z)) taskYIELD();
+            }
+        }
+next_beep:;
+        // out stays alive — I2S and amp remain warm for next beep.
+    }
+}
+
+static void initBeepTask() {
+    if (g_beepQueue) return;
+    g_beepQueue = xQueueCreate(1, sizeof(BeepRequest));
+    xTaskCreatePinnedToCore(uiBeepTask, "uiBeep", 4096, nullptr, 1, nullptr, AUDIO_TASK_CORE);
+}
+
+void uiBeep(unsigned int freq, unsigned long ms) {
+#if defined(HAS_NS4168_SPKR)
+    if (!bruceConfig.soundEnabled) return;
+    initBeepTask();
+    BeepRequest req = {freq, ms};
+    xQueueOverwrite(g_beepQueue, &req);
+#elif defined(BUZZ_PIN)
+    _tone(freq, ms);
+#endif
+}
+

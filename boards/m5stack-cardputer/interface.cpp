@@ -1,7 +1,9 @@
 #include "core/powerSave.h"
 #include "core/utils.h"
+#include "hw_profiles.h"
 #include <Adafruit_TCA8418.h>
 #include <Keyboard.h>
+#include <Preferences.h>
 #include <Wire.h>
 #include <interface.h>
 
@@ -77,6 +79,91 @@ inline void mapRawKeyToPhysical(uint8_t keyvalue, uint8_t &row, uint8_t &col) {
 }
 
 /***************************************************************************************
+** Hardware profile helpers (Cap CC1101 / Cap LoRa / Stock)
+***************************************************************************************/
+const char *hwProfileName(uint8_t prof) {
+    switch (prof) {
+        case HW_CAP_CC1101: return "Cap CC1101";
+        case HW_CAP_LORA:   return "Cap LoRa (beta)";
+        case HW_STOCK:      return "Stock";
+        case HW_GROVE_GPS:  return "Grove GPS v1.1";
+        default:            return "Unknown";
+    }
+}
+
+uint8_t loadHWProfile() {
+    Preferences prefs;
+    prefs.begin("bruce_hw", /*readOnly=*/true);
+    uint8_t v = prefs.getUChar("profile", HW_CAP_CC1101);
+    prefs.end();
+    return v < HW_PROFILE_COUNT ? v : HW_CAP_CC1101;
+}
+
+void saveHWProfile(uint8_t prof) {
+    Preferences prefs;
+    prefs.begin("bruce_hw", /*readOnly=*/false);
+    prefs.putUChar("profile", prof);
+    prefs.end();
+}
+
+void applyHWProfile(uint8_t prof) {
+    // SPI bus is shared across all Cap variants
+    bruceConfigPins.CC1101_bus.sck  = (gpio_num_t)40;
+    bruceConfigPins.CC1101_bus.miso = (gpio_num_t)39;
+    bruceConfigPins.CC1101_bus.mosi = (gpio_num_t)14;
+
+    switch (prof) {
+        case HW_CAP_CC1101:
+            // M5-U219: CS=G5, GDO0=G15; G13 is RF_SW0 (band switch), not CS.
+            // GPS moved to G1/G2 to free G13/G15 for the Cap.
+            // NFC (ST25R3916): CS=G6, IRQ=G4, shared SPI (G40/G14/G39).
+            bruceConfigPins.CC1101_bus.cs  = (gpio_num_t)5;
+            bruceConfigPins.CC1101_bus.io0 = (gpio_num_t)15;
+            bruceConfigPins.gps_bus.rx     = (gpio_num_t)1;
+            bruceConfigPins.gps_bus.tx     = (gpio_num_t)2;
+            bruceConfigPins.gpsBaudrate    = 115200;
+            bruceConfigPins.ST25R_bus.sck  = (gpio_num_t)40;
+            bruceConfigPins.ST25R_bus.miso = (gpio_num_t)39;
+            bruceConfigPins.ST25R_bus.mosi = (gpio_num_t)14;
+            bruceConfigPins.ST25R_bus.cs   = (gpio_num_t)6;  // NFC_CS
+            bruceConfigPins.ST25R_bus.io0  = (gpio_num_t)4;  // NFC_IRQ
+            bruceConfigPins.rfidModule     = ST25R3916_SPI_MODULE;
+            break;
+
+        case HW_CAP_LORA:
+            // Cap LoRa SX1262 — NSS=G5, SPI shared (14/39/40).
+            // GPS back to G15/G13 (G13 is free; no RF_SW0 needed for LoRa).
+            // NOTE: RST/BUSY/IRQ naming in Bruce not yet validated; LoRa pins
+            //       default to ini values until confirmed.
+            bruceConfigPins.LoRa_bus.cs    = (gpio_num_t)5;
+            bruceConfigPins.LoRa_bus.sck   = (gpio_num_t)40;
+            bruceConfigPins.LoRa_bus.miso  = (gpio_num_t)39;
+            bruceConfigPins.LoRa_bus.mosi  = (gpio_num_t)14;
+            bruceConfigPins.gps_bus.rx     = (gpio_num_t)15;
+            bruceConfigPins.gps_bus.tx     = (gpio_num_t)13;
+            bruceConfigPins.gpsBaudrate    = 115200;
+            break;
+
+        case HW_STOCK:
+        default:
+            // Standard Cardputer-Adv with a third-party CC1101 shield (CS=G13, GDO0=G5).
+            bruceConfigPins.CC1101_bus.cs  = (gpio_num_t)13;
+            bruceConfigPins.CC1101_bus.io0 = (gpio_num_t)5;
+            bruceConfigPins.gps_bus.rx     = (gpio_num_t)15;
+            bruceConfigPins.gps_bus.tx     = (gpio_num_t)13;
+            bruceConfigPins.gpsBaudrate    = 115200;
+            break;
+
+        case HW_GROVE_GPS:
+            // GPS Unit v1.1 (MAX2659 LNA) on Grove port — no Cap module attached.
+            bruceConfigPins.gps_bus.rx  = (gpio_num_t)1;
+            bruceConfigPins.gps_bus.tx  = (gpio_num_t)2;
+            bruceConfigPins.gpsBaudrate = 9600;
+            break;
+    }
+}
+
+/***************************************************************************************
 ** Function name: _setup_gpio()
 ** Location: main.cpp
 ** Description:   initial setup for the device
@@ -84,9 +171,14 @@ inline void mapRawKeyToPhysical(uint8_t keyvalue, uint8_t &row, uint8_t &col) {
 void _setup_gpio() {
     //    Keyboard.begin();
     pinMode(0, INPUT);
-    pinMode(5, OUTPUT);
-    // Set GPIO5 HIGH for SD card compatibility (thx for the tip @bmorcelli & 7h30th3r0n3)
-    digitalWrite(5, HIGH);
+    // Set ALL SPI chip-select pins HIGH before SD card init.
+    // setupSdCard() runs before _post_setup_gpio(), so without this the NRF24/CC1101/LoRa
+    // CS pins are floating and can pull the shared SPI bus (G40/G39/G14) low, causing
+    // SD.begin() to time out or return corrupted data.
+    pinMode(5,  OUTPUT); digitalWrite(5,  HIGH); // LoRa/Cap CC1101 CS + original SD compat note
+    pinMode(6,  OUTPUT); digitalWrite(6,  HIGH); // NRF24 CS
+    pinMode(12, OUTPUT); digitalWrite(12, HIGH); // SD card CS (defensive)
+    pinMode(13, OUTPUT); digitalWrite(13, HIGH); // CC1101 CS (Stock profile)
 }
 volatile bool kb_interrupt = false;
 void IRAM_ATTR gpio_isr_handler(void *arg) {
@@ -129,15 +221,7 @@ void _post_setup_gpio() {
     bruceConfigPins.sys_i2c.sda = (gpio_num_t)8;
     bruceConfigPins.sys_i2c.scl = (gpio_num_t)9;
 
-    bruceConfigPins.gps_bus.rx = (gpio_num_t)15;
-    bruceConfigPins.gps_bus.tx = (gpio_num_t)13;
-    bruceConfigPins.gpsBaudrate = 115200;
-
-    bruceConfigPins.CC1101_bus.sck = (gpio_num_t)40;
-    bruceConfigPins.CC1101_bus.miso = (gpio_num_t)39;
-    bruceConfigPins.CC1101_bus.mosi = (gpio_num_t)14;
-    bruceConfigPins.CC1101_bus.cs = (gpio_num_t)13;
-    bruceConfigPins.CC1101_bus.io0 = (gpio_num_t)5;
+    applyHWProfile(loadHWProfile());
 
     bruceConfigPins.NRF24_bus.sck = (gpio_num_t)40;
     bruceConfigPins.NRF24_bus.miso = (gpio_num_t)39;
@@ -303,6 +387,8 @@ void InputHandler(void) {
                 }
 
                 if (!pressed) continue;
+
+                uiBeep(); // click sound on every physical keypress (non-blocking)
 
                 if (gui) {
                     key.gui = true;
@@ -489,6 +575,11 @@ void checkReboot() {}
 **********************************************************************/
 void _setup_codec_speaker(bool enable) {
     if (!UseTCA8418) return;
+    // disabled_bulk_data = {0} is a no-op on hardware (ES8311 stays powered).
+    // So only the enable path needs guarding — once initialized, never re-init.
+    static bool codecInitialized = false;
+    if (enable && codecInitialized) return;
+    if (enable) codecInitialized = true;
 
     static constexpr const uint8_t enabled_bulk_data[] = {
         2, 0x00, 0x80, // 0x00 RESET/  CSM POWER ON

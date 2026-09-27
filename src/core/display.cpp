@@ -666,7 +666,7 @@ int loopOptions(
 #ifdef HAS_KEYBOARD
                 check(PrevPress);
                 int prevEnabled = findNextEnabled(index, -1);
-                if (prevEnabled >= 0) index = prevEnabled;
+                if (prevEnabled >= 0) { index = prevEnabled; }
                 redraw = true;
 #else
                 long _tmp = millis();

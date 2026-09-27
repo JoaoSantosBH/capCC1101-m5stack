@@ -1,4 +1,5 @@
 #include "sd_functions.h"
+#include <driver/gpio.h> // gpio_reset_pin() — resets ESP32 GPIO routing matrix
 #include "bus_HAL.h"
 #include "display.h" // using displayRedStripe as error msg
 #include "modules/badusb_ble/ducky_typer.h"
@@ -90,6 +91,18 @@ bool setupSdCard(uint8_t maxFiles) {
             }
         } else {
             // SDCard on a dedicated bus: it's the anchor/owner of sdcardSPI, so start it here.
+            // Reset the ESP32 GPIO routing matrix for all SD pins.
+            // M5Launcher (and other apps) leave the GPIO matrix pointing to their own SPI
+            // peripheral assignments. sdcardSPI.end() only tears down the Arduino object —
+            // it does NOT clear the hardware routing registers. gpio_reset_pin() sets each
+            // pin back to default I/O mode so sdcardSPI.begin() can re-route them cleanly.
+            gpio_reset_pin((gpio_num_t)bruceConfigPins.SDCARD_bus.sck);
+            gpio_reset_pin((gpio_num_t)bruceConfigPins.SDCARD_bus.miso);
+            gpio_reset_pin((gpio_num_t)bruceConfigPins.SDCARD_bus.mosi);
+            gpio_reset_pin((gpio_num_t)bruceConfigPins.SDCARD_bus.cs);
+            SD.end();
+            sdcardSPI.end();
+            delay(50);
             if (!sdcardSPI.begin(
                     (int8_t)bruceConfigPins.SDCARD_bus.sck,
                     (int8_t)bruceConfigPins.SDCARD_bus.miso,
@@ -512,12 +525,8 @@ bool sortList(const FileList &a, const FileList &b) {
     if (a.folder != b.folder) {
         return a.folder > b.folder; // true if a is a folder and b is not
     }
-    // Order items alphabetically
-    String fa = a.filename.c_str();
-    fa.toUpperCase();
-    String fb = b.filename.c_str();
-    fb.toUpperCase();
-    return fa < fb;
+    // Order items alphabetically — strcasecmp avoids heap allocations on every comparison
+    return strcasecmp(a.filename.c_str(), b.filename.c_str()) < 0;
 }
 
 /***************************************************************************************
@@ -549,19 +558,26 @@ bool checkExt(String ext, String pattern) {
 ** Description:   read files/folders from a folder
 ***************************************************************************************/
 void readFs(FS &fs, const String &folder, const String &allowed_ext) {
-    int allFilesCount = 0;
     fileList.clear();
     FileList object;
 
     File root = fs.open(folder);
     if (!root || !root.isDirectory()) { return; }
 
+    // Feed the TWDT at least every 100ms regardless of how slow the SD card is.
+    // Counting iterations is unreliable — each getNextFileName() can take
+    // 10-100ms on FAT32, so a fixed interval can silently hit the 5s timeout.
+    unsigned long lastYield = millis();
     while (true) {
+        if (millis() - lastYield >= 100) {
+            vTaskDelay(pdMS_TO_TICKS(1));
+            lastYield = millis();
+        }
+
         bool isDir;
         String fullPath = root.getNextFileName(&isDir);
         String nameOnly = fullPath.substring(fullPath.lastIndexOf("/") + 1);
         if (fullPath == "") { break; }
-        // Serial.printf("Path: %s (isDir: %d)\n", fullPath.c_str(), isDir);
 
         if (isDir) {
             object.filename = nameOnly;
